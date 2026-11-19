@@ -644,7 +644,7 @@ def main():
     # time shifts by a different random amount every day, so Naukri never sees
     # a perfectly repeating pattern (e.g. always exactly 09:03:00).
     # Skip the delay if running manually from command line with --no-delay flag.
-    if "--no-delay" not in sys.argv:
+    if "--no-delay" not in sys.argv and os.environ.get("GITHUB_ACTIONS") != "true":
         delay_secs = randint(60, 420)   # 1 min to 7 min
         log_msg("Humanization delay: %d seconds (~%d min) before starting." % (
             delay_secs, delay_secs // 60
@@ -681,8 +681,9 @@ def main():
 
     log_msg("-----Naukri.py Script Run Ended-----\n")
 
-    # Schedule the Mac to wake up for the next upload slot
-    schedule_next_wake()
+    # Schedule the Mac to wake up for the next upload slot (macOS only)
+    if sys.platform == "darwin":
+        schedule_next_wake()
 
 
 def schedule_next_wake():

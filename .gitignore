@@ -166,5 +166,17 @@ cython_debug/
 # Test files
 /tests/*output*
 
-constants.py
-**/constants.py
+# constants.py is safe to commit — credentials are read from env vars / GitHub Secrets
+# !constants.py
+
+# macOS LaunchAgent plists (local only)
+*.plist
+
+# Local log files
+naukri_launchd.log
+naukri_launchd_error.log
+*.log
+
+# Local dated resume copies (generated at runtime)
+resume/Rahul_Varanasi-Resume-*.docx
+resume/Rahul_Varanasi-Resume-*.pdf
