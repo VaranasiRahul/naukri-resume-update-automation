@@ -5,11 +5,17 @@
 import io
 import logging
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
 from random import choice, randint
 from string import ascii_uppercase, digits
+
+try:
+    import schedule
+except ImportError:
+    schedule = None  # scheduler is optional; only needed for --schedule mode
 
 from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import letter
@@ -20,36 +26,116 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.chrome.service import Service as ChromeService
 import constants
 
-# Add folder Path of your resume
-originalResumePath = constants.ORIGINAL_RESUME_PATH
-# Add Path where modified resume should be saved
-modifiedResumePath = constants.MODIFIED_RESUME_PATH
-
-# Update your naukri username and password here before running
+# ── Credentials & paths from constants ──────────────────────────────────────
 username = constants.USERNAME
 password = constants.PASSWORD
 mob = constants.MOBILE
 
-# False if you dont want to add Random HIDDEN chars to your resume
+originalResumePath = constants.ORIGINAL_RESUME_PATH
+
+# Output directory: use the same folder as the original resume if not set
+_resume_output_dir = (
+    constants.RESUME_OUTPUT_DIR
+    if constants.RESUME_OUTPUT_DIR
+    else os.path.dirname(os.path.abspath(originalResumePath))
+)
+resumeBasename = constants.RESUME_BASENAME
+
+# ── Feature flags ────────────────────────────────────────────────────────────
+# Set True only if your resume is a PDF and you want hidden random text added.
 updatePDF = False
 
-# If Headless = True, script runs Chrome in headless mode without visible GUI
-headless = False
+# If Headless = True, Chrome runs without a visible window.
+# Set to True so Chrome doesn't pop up during your daily work.
+headless = True
 
-# ----- No other changes required -----
-
-# Set login URL
+# ── URLs ─────────────────────────────────────────────────────────────────────
 NaukriURL = constants.NAUKRI_LOGIN_URL
 
 logging.basicConfig(
     level=logging.INFO, filename="naukri.log", format="%(asctime)s    : %(message)s"
 )
-# logging.disable(logging.CRITICAL)
 os.environ["WDM_LOCAL"] = "1"
 os.environ["WDM_LOG_LEVEL"] = "0"
+
+
+# ── Slot / rename helpers ─────────────────────────────────────────────────────
+
+def get_slot_number():
+    """
+    Return 1 if current time is before the midpoint between the two schedule
+    slots, otherwise return 2.
+
+    Using the MIDPOINT (not the exact slot1 time) as the boundary avoids a
+    race condition where launchd fires a few seconds after 9:00:00, causing
+    the script to wrongly report slot 2.
+
+    Example with slot1=09:00, slot2=14:00:
+      midpoint = 11:30 AM
+      Before 11:30 → slot 1  (morning upload)
+      11:30 or later → slot 2  (afternoon upload)
+    """
+    now = datetime.now()
+    slot1_h, slot1_m = map(int, constants.SCHEDULE_TIME_SLOT_1.split(":"))
+    slot2_h, slot2_m = map(int, constants.SCHEDULE_TIME_SLOT_2.split(":"))
+
+    # Total minutes from midnight for each slot
+    slot1_mins = slot1_h * 60 + slot1_m
+    slot2_mins = slot2_h * 60 + slot2_m
+    midpoint_mins = (slot1_mins + slot2_mins) // 2
+
+    now_mins = now.hour * 60 + now.minute
+    return 1 if now_mins < midpoint_mins else 2
+
+
+def get_renamed_resume_path():
+    """
+    Build a timestamped copy path for the resume.
+
+    Pattern:  <RESUME_BASENAME>-<DD><mon><slot>.<ext>
+    Examples:
+        Rahul_Varanasi-DevOps-Resume-23jun1.docx   (9 AM upload on 23 June)
+        Rahul_Varanasi-DevOps-Resume-23jun2.docx   (2 PM upload on 23 June)
+        Rahul_Varanasi-DevOps-Resume-24jun1.docx   (9 AM upload on 24 June)
+    """
+    now = datetime.now()
+    day = now.strftime("%d").lstrip("0")   # e.g. "23" → "23", "05" → "5"
+    month = now.strftime("%b").lower()     # e.g. "jun"
+    slot = get_slot_number()               # 1 or 2
+
+    _, ext = os.path.splitext(originalResumePath)  # e.g. ".docx" or ".pdf"
+    filename = f"{resumeBasename}-{day}{month}{slot}{ext}"
+    return os.path.join(_resume_output_dir, filename)
+
+
+# ── Humanization helpers ──────────────────────────────────────────────────────
+
+# Rotating pool of real Mac Chrome user-agents.
+# A different one is picked each run so the fingerprint changes daily.
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_7_10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+]
+
+
+def human_type(element, text):
+    """
+    Type text into an element character-by-character with random delays,
+    mimicking the speed of a real human typist (50–180 ms per character).
+    """
+    for char in text:
+        element.send_keys(char)
+        time.sleep(randint(50, 180) / 1000.0)
+
+
+def human_pause(min_ms=300, max_ms=900):
+    """Random short pause between UI actions to simulate human reaction time."""
+    time.sleep(randint(min_ms, max_ms) / 1000.0)
 
 
 def log_msg(message):
@@ -221,26 +307,55 @@ def randomText():
 
 
 def LoadNaukri(headless):
-    """Open Chrome to load Naukri.com"""
+    """Open Chrome to load Naukri.com with anti-bot-detection options."""
 
     options = webdriver.ChromeOptions()
+
+    # ── Standard options ──────────────────────────────────────────────────────
     options.add_argument("--disable-notifications")
-    options.add_argument("--start-maximized")  # ("--kiosk") for MAC
+    options.add_argument("--start-maximized")
     options.add_argument("--disable-popups")
     options.add_argument("--disable-gpu")
-    if headless:
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
 
-    # updated to use latest selenium Chrome service
+    # ── Anti-bot-detection options ────────────────────────────────────────────
+    # Naukri uses Cloudflare which fingerprints headless Chrome. These options
+    # make the browser look like a regular user session.
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    # Rotate user-agent on every run so the fingerprint changes daily
+    chosen_ua = choice(USER_AGENTS)
+    options.add_argument(f"user-agent={chosen_ua}")
+    log_msg(f"Using user-agent: {chosen_ua[:60]}...")
+
+    # Randomise window size slightly so it's never the same exact viewport
+    width  = randint(1280, 1440)
+    height = randint(800, 900)
+    options.add_argument(f"--window-size={width},{height}")
+
+    if headless:
+        # Use the newer headless mode — significantly less detectable than the
+        # old '--headless' flag which Cloudflare easily identifies.
+        options.add_argument("--headless=new")
+
+    # ── Launch driver ─────────────────────────────────────────────────────────
     driver = None
     try:
         driver = webdriver.Chrome(options=options, service=ChromeService())
     except Exception as e:
         print(f"Error launching Chrome: {e}")
         driver = webdriver.Chrome(options)
-    log_msg("Google Chrome Launched!")
 
+    # Mask the webdriver property that sites check via JavaScript
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+    )
+
+    log_msg("Google Chrome Launched!")
     driver.implicitly_wait(5)
     driver.get(NaukriURL)
     return driver
@@ -275,11 +390,13 @@ def naukriLogin(headless=False):
 
         if emailFieldElement is not None:
             emailFieldElement.clear()
-            emailFieldElement.send_keys(username)
-            time.sleep(1)
+            human_pause(400, 800)        # pause before typing, like a real user
+            human_type(emailFieldElement, username)
+            human_pause(300, 700)
             passFieldElement.clear()
-            passFieldElement.send_keys(password)
-            time.sleep(1)
+            human_pause(200, 500)
+            human_type(passFieldElement, password)
+            human_pause(500, 1000)       # think before clicking login
             loginButton.send_keys(Keys.ENTER)
             time.sleep(3)
 
@@ -373,43 +490,96 @@ def UpdateProfile(driver):
 
 
 
-def UpdateResume():
+def PrepareResume():
+    """
+    Prepare the resume file to upload.
+
+    - For .docx / any non-PDF file: simply copy the original to a new
+      timestamped filename so Naukri sees it as a fresh document.
+    - For .pdf files with updatePDF=True: additionally embed invisible random
+      text (original behaviour) before saving to the timestamped path.
+
+    Returns the absolute path of the file to upload.
+    """
+    dest_path = get_renamed_resume_path()
+
     try:
-        # Random text with random location and size
-        txt = randomText()
-        xloc = randint(700, 1000)  # This ensures that text is 'out of page'
-        fsize = randint(1, 10)
+        _, ext = os.path.splitext(originalResumePath)
+        is_pdf = ext.lower() == ".pdf"
 
-        packet = io.BytesIO()
-        can = canvas.Canvas(packet, pagesize=letter)
-        can.setFont("Helvetica", fsize)
-        can.drawString(xloc, 100, txt)
-        can.save()
+        if is_pdf and updatePDF:
+            # ── PDF path: embed hidden random text ──────────────────────────
+            txt = randomText()
+            xloc = randint(700, 1000)  # far right – outside visible page area
+            fsize = randint(1, 10)
 
-        packet.seek(0)
-        new_pdf = PdfReader(packet)
-        with open(originalResumePath, "rb") as f:
-            existing_pdf = PdfReader(f)
-            pagecount = len(existing_pdf.pages)
-            print("Found %s pages in PDF" % pagecount)
+            packet = io.BytesIO()
+            can = canvas.Canvas(packet, pagesize=letter)
+            can.setFont("Helvetica", fsize)
+            can.drawString(xloc, 100, txt)
+            can.save()
+            packet.seek(0)
 
-            output = PdfWriter()
-            # Merging new pdf with last page of existing pdf
-            for pageNum in range(pagecount - 1):
-                output.add_page(existing_pdf.pages[pageNum])
-            page = existing_pdf.pages[pagecount - 1]
-            page.merge_page(new_pdf.pages[0])
-            output.add_page(page)
+            new_pdf = PdfReader(packet)
+            with open(originalResumePath, "rb") as f:
+                existing_pdf = PdfReader(f)
+                pagecount = len(existing_pdf.pages)
+                log_msg("Found %s pages in PDF" % pagecount)
 
-            # Save the new resume file
-            with open(modifiedResumePath, "wb") as outputStream:
-                output.write(outputStream)
-            print("Saved modified PDF: %s" % modifiedResumePath)
-            return os.path.abspath(modifiedResumePath)
+                output = PdfWriter()
+                for pageNum in range(pagecount - 1):
+                    output.add_page(existing_pdf.pages[pageNum])
+                page = existing_pdf.pages[pagecount - 1]
+                page.merge_page(new_pdf.pages[0])
+                output.add_page(page)
+
+                with open(dest_path, "wb") as out_stream:
+                    output.write(out_stream)
+
+            log_msg("Saved modified PDF to: %s" % dest_path)
+        else:
+            # ── Non-PDF (docx etc.) or PDF without hidden-text: just copy ───
+            shutil.copy2(originalResumePath, dest_path)
+            log_msg("Copied resume to: %s" % dest_path)
+
+        return os.path.abspath(dest_path)
+
     except Exception as e:
         catch(e)
-    return os.path.abspath(originalResumePath)
+        log_msg("PrepareResume failed – falling back to original file.")
+        return os.path.abspath(originalResumePath)
 
+
+
+def cleanup_old_resumes(days_to_keep=7):
+    """
+    Delete dated resume copies (e.g. Rahul_Varanasi-Resume-23jun1.docx) that
+    are older than `days_to_keep` days from the resume output directory.
+    The original resume file (matching ORIGINAL_RESUME_PATH) is never deleted.
+    """
+    try:
+        original_abs = os.path.abspath(originalResumePath)
+        _, ext = os.path.splitext(originalResumePath)
+        cutoff = time.time() - (days_to_keep * 86400)
+        deleted = []
+
+        for fname in os.listdir(_resume_output_dir):
+            # Only touch files that match our basename pattern and extension
+            if not (fname.startswith(resumeBasename + "-") and fname.endswith(ext)):
+                continue
+            fpath = os.path.join(_resume_output_dir, fname)
+            if os.path.abspath(fpath) == original_abs:
+                continue  # never delete the original
+            if os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+                deleted.append(fname)
+
+        if deleted:
+            log_msg("Cleaned up %d old resume copy(s): %s" % (len(deleted), ", ".join(deleted)))
+        else:
+            log_msg("No old resume copies to clean up.")
+    except Exception as e:
+        catch(e)
 
 
 def UploadResume(driver, resumePath):
@@ -436,7 +606,7 @@ def UploadResume(driver, resumePath):
             AttachElement = GetElement(driver, attachCVID, locator="ID")
             AttachElement.send_keys(os.path.abspath(resumePath))
 
-        if WaitTillElementPresent(driver, saveXpath, locator="ID", timeout=5):
+        if WaitTillElementPresent(driver, saveXpath, locator="XPATH", timeout=5):
             saveElement = GetElement(driver, saveXpath, locator="XPATH")
             saveElement.click()
 
@@ -465,18 +635,35 @@ def UploadResume(driver, resumePath):
 
 
 def main():
+    """Single run: login → update profile → upload renamed resume → logout."""
     log_msg("-----Naukri.py Script Run Begin-----")
+    log_msg("Upload slot: %s" % get_slot_number())
+
+    # ── Random startup delay ──────────────────────────────────────────────────
+    # Sleep 1–7 minutes before doing anything. This means the actual execution
+    # time shifts by a different random amount every day, so Naukri never sees
+    # a perfectly repeating pattern (e.g. always exactly 09:03:00).
+    # Skip the delay if running manually from command line with --no-delay flag.
+    if "--no-delay" not in sys.argv:
+        delay_secs = randint(60, 420)   # 1 min to 7 min
+        log_msg("Humanization delay: %d seconds (~%d min) before starting." % (
+            delay_secs, delay_secs // 60
+        ))
+        time.sleep(delay_secs)
+
+    log_msg("Actual start time: %s" % datetime.now().strftime("%H:%M:%S"))
     driver = None
     try:
         status, driver = naukriLogin(headless)
         if status:
             UpdateProfile(driver)
             if os.path.exists(originalResumePath):
-                if updatePDF:
-                    resumePath = UpdateResume()
-                    UploadResume(driver, resumePath)
-                else:
-                    UploadResume(driver, originalResumePath)
+                # Always prepare (copy/rename) the resume before uploading so
+                # Naukri registers a new file with the date-slot suffix.
+                resumePath = PrepareResume()
+                UploadResume(driver, resumePath)
+                # Clean up resume copies older than 7 days
+                cleanup_old_resumes(days_to_keep=7)
             else:
                 log_msg("Resume not found at %s " % originalResumePath)
 
@@ -494,6 +681,107 @@ def main():
 
     log_msg("-----Naukri.py Script Run Ended-----\n")
 
+    # Schedule the Mac to wake up for the next upload slot
+    schedule_next_wake()
+
+
+def schedule_next_wake():
+    """
+    Use macOS 'pmset' to schedule a one-time wake event 8 minutes before
+    the next upload slot. This ensures the Mac wakes from sleep (lid closed)
+    in time for launchd to trigger the script.
+
+    Requires the laptop to be plugged into power to wake from lid-closed sleep.
+    Silently skips if pmset is unavailable or user lacks permissions.
+
+    Wake times scheduled:
+      Slot 1 (morning) → wakes 8 min before SCHEDULE_TIME_SLOT_1 (e.g. 08:55)
+      Slot 2 (afternoon) → wakes 8 min before SCHEDULE_TIME_SLOT_2 (e.g. 13:55)
+    """
+    try:
+        import subprocess
+        now = datetime.now()
+        current_slot = get_slot_number()
+
+        # Determine which slot comes NEXT
+        if current_slot == 1:
+            # Just ran slot 1 → schedule wake for slot 2
+            slot_h, slot_m = map(int, constants.SCHEDULE_TIME_SLOT_2.split(":"))
+            wake_label = "afternoon"
+        else:
+            # Just ran slot 2 → schedule wake for slot 1 tomorrow
+            slot_h, slot_m = map(int, constants.SCHEDULE_TIME_SLOT_1.split(":"))
+            wake_label = "morning (tomorrow)"
+
+        # Wake 8 minutes before the launchd trigger time
+        wake_m = slot_m - 8
+        wake_h = slot_h
+        if wake_m < 0:
+            wake_m += 60
+            wake_h -= 1
+
+        # Build the date: today for slot 2, tomorrow for slot 1 (next morning)
+        if current_slot == 1:
+            wake_date = now.strftime("%m/%d/%Y")
+        else:
+            from datetime import timedelta
+            wake_date = (now + timedelta(days=1)).strftime("%m/%d/%Y")
+
+        wake_time_str = "%s %02d:%02d:00" % (wake_date, wake_h, wake_m)
+
+        result = subprocess.run(
+            ["sudo", "-n", "pmset", "schedule", "wake", wake_time_str],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            log_msg("Mac wake scheduled for %s upload at %s" % (wake_label, wake_time_str))
+        else:
+            # sudo -n fails silently if password is required — that's fine
+            log_msg("Mac wake scheduling skipped (sudo not available without password). "
+                    "Keep laptop plugged in and lid open for automatic wake.")
+    except Exception as e:
+        # Non-critical — don't crash the script over this
+        log_msg("Could not schedule Mac wake: %s" % e)
+
+
+# ── Scheduler (twice-daily daemon mode) ──────────────────────────────────────
+
+def run_scheduler():
+    """
+    Run as a long-lived daemon that triggers `main()` at the two configured
+    times every day.
+
+    Usage:
+        python naukri.py --schedule
+
+    The script will stay alive and wake up at SCHEDULE_TIME_SLOT_1 and
+    SCHEDULE_TIME_SLOT_2 (defined in constants.py) to perform the upload.
+    """
+    if schedule is None:
+        log_msg(
+            "ERROR: 'schedule' package is not installed. "
+            "Run: pip install schedule"
+        )
+        sys.exit(1)
+
+    t1 = constants.SCHEDULE_TIME_SLOT_1  # e.g. "09:00"
+    t2 = constants.SCHEDULE_TIME_SLOT_2  # e.g. "14:00"
+
+    schedule.every().day.at(t1).do(main)
+    schedule.every().day.at(t2).do(main)
+
+    log_msg(
+        "Scheduler started. Jobs scheduled at %s and %s every day. "
+        "Press Ctrl+C to stop." % (t1, t2)
+    )
+
+    while True:
+        schedule.run_pending()
+        time.sleep(30)  # check every 30 seconds
+
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--schedule":
+        run_scheduler()
+    else:
+        main()

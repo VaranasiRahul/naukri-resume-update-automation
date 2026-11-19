@@ -1,0 +1,90 @@
+name: Notify on Upstream Updates
+
+on:
+  schedule:
+    # Runs every day at 8:00 AM UTC (1:30 PM IST)
+    - cron: '0 8 * * *'
+  workflow_dispatch:  # Also allows manual trigger from GitHub UI
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout your private repo
+        uses: actions/checkout@v4
+
+      - name: Get latest commit SHA from upstream (navchandar/Naukri)
+        id: upstream
+        run: |
+          LATEST_SHA=$(curl -s \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/navchandar/Naukri/commits/master \
+            | jq -r '.sha')
+          echo "sha=$LATEST_SHA" >> $GITHUB_OUTPUT
+          echo "Upstream latest SHA: $LATEST_SHA"
+
+      - name: Read last known SHA (stored in repo)
+        id: stored
+        run: |
+          if [ -f .upstream_sha ]; then
+            STORED_SHA=$(cat .upstream_sha)
+          else
+            STORED_SHA="none"
+          fi
+          echo "sha=$STORED_SHA" >> $GITHUB_OUTPUT
+          echo "Stored SHA: $STORED_SHA"
+
+      - name: Compare SHAs and create issue if changed
+        if: steps.upstream.outputs.sha != steps.stored.outputs.sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          # Get commit details for a useful notification
+          COMMIT_INFO=$(curl -s \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/navchandar/Naukri/commits/$UPSTREAM_SHA)
+
+          COMMIT_MSG=$(echo "$COMMIT_INFO" | jq -r '.commit.message')
+          COMMIT_DATE=$(echo "$COMMIT_INFO" | jq -r '.commit.author.date')
+          COMMIT_URL=$(echo "$COMMIT_INFO" | jq -r '.html_url')
+          AUTHOR=$(echo "$COMMIT_INFO" | jq -r '.commit.author.name')
+
+          # Create an issue in YOUR private repo
+          gh issue create \
+            --title "⚠️ Upstream update detected: navchandar/Naukri" \
+            --body "The original Naukri repo has been updated. Review and merge if needed.
+
+          ## Commit Details
+          - **Message:** $COMMIT_MSG
+          - **Author:** $AUTHOR
+          - **Date:** $COMMIT_DATE
+          - **Link:** $COMMIT_URL
+
+          ## What to do
+          1. Ask Antigravity (AI) to review the changes and merge into your customized repo
+          2. Run: \`git fetch upstream && git merge upstream/master\`
+          3. Resolve any conflicts (especially in \`naukri.py\` and \`constants.py\`)
+          4. Push: \`git push origin master\`
+          5. Close this issue once done." \
+            --label "upstream-update"
+
+          echo "Issue created!"
+
+      - name: Update stored SHA
+        if: steps.upstream.outputs.sha != steps.stored.outputs.sha
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$UPSTREAM_SHA" > .upstream_sha
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .upstream_sha
+          git commit -m "chore: update upstream SHA tracker to $UPSTREAM_SHA"
+          git push
+
+      - name: No update found
+        if: steps.upstream.outputs.sha == steps.stored.outputs.sha
+        run: echo "✅ No upstream changes. All good."
